@@ -1,0 +1,4 @@
+myhttpserver
+*.o
+*.out
+.vscode
