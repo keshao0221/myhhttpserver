@@ -43,7 +43,7 @@ curl -i http://localhost:8080/notexist
 ## 版本路线
 
 - V0（已完成）：单线程阻塞 I/O，基础路由，JSON API
-- V1（计划中）：epoll + 非阻塞 I/O + Reactor 模式
+- V1（已完成）：epoll + 非阻塞 I/O + Reactor 模式——可接受1w+的并发，使用wrk进行压测的时候在5w并发的情况下达到了7w+的QPS以及200ms+的延迟
 - V2（后续）：线程池 + 内存池 + 定时器
 
 ## 许可证
