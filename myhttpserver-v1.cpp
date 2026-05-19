@@ -1,275 +1,361 @@
-#include<iostream>
-#include<cstring>
-#include<unistd.h>
-#include<arpa/inet.h>
-#include<string>
-#include<sstream>
-#include<fcntl.h>
-#include<sys/socket.h>
-#include<sys/epoll.h>
-#include<unordered_map>
+#include <iostream>
+#include <string>
+#include <cstring>
+#include <cstdio>
+#include <ctime>
+#include <vector>
+#include <unordered_map>
 
-const int MAX_REQUESTS=1024;
-const int TIMEOUT=30;
-const int MAX_EVENTS=1024;
+#include <unistd.h>
+#include <fcntl.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/epoll.h>
 
-// 全局变量，用于非阻塞恢复监听
-int epfd_global = -1;
-int listen_fd_global = -1;
-bool listen_paused = false;
+namespace {
 
-// 恢复监听辅助函数
-void try_resume_listen() {
-    if (listen_paused) {
-        struct epoll_event ev;
-        ev.events = EPOLLIN;
-        ev.data.fd = listen_fd_global;
-        if (epoll_ctl(epfd_global, EPOLL_CTL_ADD, listen_fd_global, &ev) == 0) {
-            listen_paused = false;
-        }
-    }
+constexpr int MAX_EVENTS            = 1024;
+constexpr int EPOLL_WAIT_MS         = 1;
+constexpr int TIMEOUT_CHECK_INTERVAL = 50;
+constexpr int MAX_REQUESTS          = 1024;
+constexpr int TIMEOUT_SECONDS       = 30;
+constexpr int READ_BUF_SIZE         = 4096;
+constexpr int DEFAULT_PORT          = 8080;
+
+constexpr const char* HTTP_HEADER_END = "\r\n\r\n";
+constexpr size_t     HTTP_HEADER_END_LEN = 4;
+
+constexpr char RESP_KEEPALIVE[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: text/plain\r\n"
+    "Content-Length: 21\r\n"
+    "Connection: keep-alive\r\n"
+    "\r\n"
+    "Hello from my server!";
+constexpr size_t RESP_KEEPALIVE_LEN = sizeof(RESP_KEEPALIVE) - 1;
+
+constexpr char RESP_CLOSE[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: text/plain\r\n"
+    "Content-Length: 21\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+    "Hello from my server!";
+constexpr size_t RESP_CLOSE_LEN = sizeof(RESP_CLOSE) - 1;
+
 }
 
-struct Connection{
-  std::string read_buf;
-  std::string write_buf;
-  size_t write_off=0;
-  int request_cnt=0;
-  time_t last_active;
-  bool keep_alive=1;
+class HttpServer {
+public:
+    explicit HttpServer(int port = DEFAULT_PORT)
+        : port_(port) {}
 
-  void reset(){
-    read_buf.clear();
-    write_buf.clear();
-    write_off=0;
-  }
+    HttpServer(const HttpServer&) = delete;
+    HttpServer& operator=(const HttpServer&) = delete;
+
+    bool start() {
+        if (!init_listen_socket()) return false;
+        if (!init_epoll()) {
+            close(listen_fd_);
+            return false;
+        }
+        return true;
+    }
+
+    void run() {
+        struct epoll_event events[MAX_EVENTS];
+
+        while (true) {
+            int nfds = epoll_wait(epfd_, events, MAX_EVENTS, EPOLL_WAIT_MS);
+
+            if (++loop_cnt_ >= TIMEOUT_CHECK_INTERVAL) {
+                loop_cnt_ = 0;
+                check_timeouts();
+            }
+
+            if (nfds == -1) {
+                std::perror("epoll_wait");
+                continue;
+            }
+
+            for (int i = 0; i < nfds; ++i) {
+                int fd = events[i].data.fd;
+                if (fd == listen_fd_) {
+                    accept_client();
+                } else {
+                    handle_client(fd, events[i].events);
+                }
+            }
+        }
+    }
+
+private:
+    struct Connection {
+        std::string read_buf;
+
+        struct ResponseRef { const char* data; size_t len; };
+        std::vector<ResponseRef> resp_queue;
+        size_t resp_idx     = 0;
+        size_t resp_off     = 0;
+        int request_cnt     = 0;
+        time_t last_active  = 0;
+        bool keep_alive     = true;
+    };
+
+    bool init_listen_socket() {
+        listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_fd_ < 0) {
+            std::perror("socket");
+            return false;
+        }
+
+        if (fcntl(listen_fd_, F_SETFL, O_NONBLOCK) == -1) {
+            std::perror("fcntl");
+            close(listen_fd_);
+            return false;
+        }
+
+        int opt = 1;
+        if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+            std::perror("setsockopt");
+            close(listen_fd_);
+            return false;
+        }
+
+        struct sockaddr_in addr{};
+        addr.sin_family      = AF_INET;
+        addr.sin_port        = htons(port_);
+        addr.sin_addr.s_addr = INADDR_ANY;
+
+        if (bind(listen_fd_,
+                 reinterpret_cast<struct sockaddr*>(&addr),
+                 sizeof(addr)) < 0) {
+            std::perror("bind");
+            close(listen_fd_);
+            return false;
+        }
+
+        if (listen(listen_fd_, SOMAXCONN) < 0) {
+            std::perror("listen");
+            close(listen_fd_);
+            return false;
+        }
+
+        return true;
+    }
+
+    bool init_epoll() {
+        epfd_ = epoll_create1(0);
+        if (epfd_ == -1) {
+            std::perror("epoll_create1");
+            return false;
+        }
+
+        struct epoll_event ev{};
+        ev.events  = EPOLLIN;
+        ev.data.fd = listen_fd_;
+        if (epoll_ctl(epfd_, EPOLL_CTL_ADD, listen_fd_, &ev) == -1) {
+            std::perror("epoll_ctl: listen_fd");
+            close(epfd_);
+            return false;
+        }
+
+        return true;
+    }
+
+    void accept_client() {
+        struct sockaddr_in client_addr{};
+        socklen_t client_len = sizeof(client_addr);
+
+        int client_fd = accept(listen_fd_,
+                               reinterpret_cast<struct sockaddr*>(&client_addr),
+                               &client_len);
+        if (client_fd == -1) {
+            if (errno == EMFILE || errno == ENFILE) {
+                pause_accept();
+            }
+            return;
+        }
+
+        if (fcntl(client_fd, F_SETFL, O_NONBLOCK) == -1) {
+            std::perror("fcntl client");
+            close(client_fd);
+            return;
+        }
+
+        struct epoll_event ev{};
+        ev.events  = EPOLLIN;
+        ev.data.fd = client_fd;
+        epoll_ctl(epfd_, EPOLL_CTL_ADD, client_fd, &ev);
+
+        auto& con = connections_[client_fd];
+        con.last_active = time(nullptr);
+    }
+
+    void close_connection(int fd) {
+        close(fd);
+        connections_.erase(fd);
+        resume_accept();
+    }
+
+    void pause_accept() {
+        epoll_ctl(epfd_, EPOLL_CTL_DEL, listen_fd_, nullptr);
+        accept_paused_ = true;
+    }
+
+    void resume_accept() {
+        if (!accept_paused_) return;
+
+        struct epoll_event ev{};
+        ev.events  = EPOLLIN;
+        ev.data.fd = listen_fd_;
+        if (epoll_ctl(epfd_, EPOLL_CTL_ADD, listen_fd_, &ev) == 0) {
+            accept_paused_ = false;
+        }
+    }
+
+    void check_timeouts() {
+        time_t now = time(nullptr);
+        for (auto it = connections_.begin(); it != connections_.end(); ) {
+            if (now - it->second.last_active > TIMEOUT_SECONDS) {
+                close(it->first);
+                it = connections_.erase(it);
+                resume_accept();
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    void handle_client(int client_fd, uint32_t events) {
+        auto it = connections_.find(client_fd);
+        if (it == connections_.end()) {
+            close_connection(client_fd);
+            return;
+        }
+
+        Connection& con = it->second;
+
+        if (events & (EPOLLERR | EPOLLHUP)) {
+            close_connection(client_fd);
+            return;
+        }
+
+        if (events & EPOLLIN) {
+            handle_read(con, client_fd);
+        }
+
+        if (events & EPOLLOUT) {
+            handle_write(con, client_fd);
+        }
+    }
+
+    void handle_read(Connection& con, int client_fd) {
+        char buf[READ_BUF_SIZE];
+        ssize_t n = read(client_fd, buf, sizeof(buf));
+
+        if (n > 0) {
+            con.read_buf.append(buf, n);
+            con.last_active = time(nullptr);
+
+            bool has_response = false;
+
+            while (true) {
+                size_t pos = con.read_buf.find(HTTP_HEADER_END);
+                if (pos == std::string::npos) break;
+
+                size_t header_end = pos + HTTP_HEADER_END_LEN;
+
+                bool client_close =
+                    con.read_buf.find("Connection: close") < header_end;
+
+                con.request_cnt++;
+
+                bool should_close =
+                    client_close || (con.request_cnt >= MAX_REQUESTS);
+                con.keep_alive = !should_close;
+
+                con.resp_queue.push_back(
+                    should_close
+                        ? Connection::ResponseRef{RESP_CLOSE, RESP_CLOSE_LEN}
+                        : Connection::ResponseRef{RESP_KEEPALIVE, RESP_KEEPALIVE_LEN});
+                has_response = true;
+
+                con.read_buf.erase(0, header_end);
+            }
+
+            if (has_response) {
+                set_events(client_fd, EPOLLOUT);
+            }
+        }
+        else if (n == 0) {
+            close_connection(client_fd);
+        }
+        else {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                std::perror("read");
+                close_connection(client_fd);
+            }
+        }
+    }
+
+    void handle_write(Connection& con, int client_fd) {
+        while (con.resp_idx < con.resp_queue.size()) {
+            auto& resp = con.resp_queue[con.resp_idx];
+            ssize_t n;
+            do {
+                n = write(client_fd, resp.data + con.resp_off,
+                          resp.len - con.resp_off);
+            } while (n == -1 && errno == EINTR);
+
+            if (n > 0) {
+                con.resp_off += n;
+                if (con.resp_off == resp.len) {
+                    con.resp_idx++;
+                    con.resp_off = 0;
+                } else {
+                    return;
+                }
+            } else if (n == -1) {
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    std::perror("write");
+                    close_connection(client_fd);
+                }
+                return;
+            } else {
+                close_connection(client_fd);
+                return;
+            }
+        }
+
+        if (!con.keep_alive) {
+            close_connection(client_fd);
+        } else {
+            con.resp_queue.clear();
+            con.resp_idx = 0;
+            set_events(client_fd, EPOLLIN);
+        }
+    }
+
+    void set_events(int fd, uint32_t events) {
+        struct epoll_event ev{};
+        ev.events  = events;
+        ev.data.fd = fd;
+        epoll_ctl(epfd_, EPOLL_CTL_MOD, fd, &ev);
+    }
+
+    int listen_fd_ = -1;
+    int epfd_      = -1;
+    int port_;
+
+    bool accept_paused_ = false;
+    int  loop_cnt_      = 0;
+
+    std::unordered_map<int, Connection> connections_;
 };
 
-std::unordered_map<int,Connection> connections;
-
-void handle_client(int client_fd,uint32_t events,int epfd){
-  auto it=connections.find(client_fd);
-  if(it==connections.end()){
-    close(client_fd);
-    try_resume_listen();
-    return;
-  }
-  Connection& con=it->second;
-
-  // 新增：处理错误挂起事件
-  if(events & (EPOLLERR | EPOLLHUP)){
-    std::cout<<"fd="<<client_fd<<" 异常断开\n";
-    close(client_fd);
-    connections.erase(it);
-    try_resume_listen();
-    return;
-  }
-
-  if(events & EPOLLIN){
-    char buf[4096];
-    ssize_t n=read(client_fd,buf,sizeof(buf)-1);
-
-    if(n>0){
-      buf[n]='\0';
-      con.read_buf.append(buf,n);
-
-      while(1){
-        size_t pos=con.read_buf.find("\r\n\r\n");
-        if(pos==std::string::npos)break;
-
-        bool client_close=0;
-        size_t search_end=pos+4;
-        if(con.read_buf.find("Connection: close")<search_end)client_close=1;
-
-        con.request_cnt++;
-        con.last_active=time(nullptr);
-
-        bool if_close=client_close||(con.request_cnt>=MAX_REQUESTS);
-        std::string keep_alive_header =if_close?"Connection: close\r\n":
-                                                "Connection: keep-alive\r\n";
-
-        std::string body="Hello from my server!";
-        std::string response="HTTP/1.1 200 OK\r\n"
-                              "Content-Type: text/plain\r\n"
-                              "Content-Length: "+ std::to_string(body.size())+"\r\n"+
-                              keep_alive_header+
-                              "\r\n"+
-                              body;
-        
-        con.keep_alive=!if_close;
-
-        con.write_buf=response;
-        con.write_off=0;
-
-        struct epoll_event ev;
-        ev.events=EPOLLOUT;
-        ev.data.fd=client_fd;
-        epoll_ctl(epfd,EPOLL_CTL_MOD,client_fd,&ev);
-
-        con.read_buf.erase(0,pos+4);
-      }
-    }else if(n==0){
-      std::cout<<"fd="<<client_fd<<"断开连接\n";
-      close(client_fd);
-      connections.erase(it);
-      try_resume_listen();
-    }else{
-      if(errno!=EAGAIN&&errno != EWOULDBLOCK){
-        std::perror("read error\n");
-        close(client_fd);
-        connections.erase(it);
-        try_resume_listen();
-      }
-    }
-  }
-  if(events & EPOLLOUT){
-    ssize_t n=write(client_fd,
-                    con.write_buf.data()+con.write_off,
-                    con.write_buf.size()-con.write_off);
-    if(n>0){
-      con.write_off+=n;
-      if(con.write_off==con.write_buf.size()){
-        if(!con.keep_alive){
-          std::cout<<"响应发送完毕 fd="<<client_fd<<" 关闭连接\n";
-          close(client_fd);
-          connections.erase(it);
-          try_resume_listen();
-        }else{
-          // 重置写缓冲区
-          con.write_buf.clear();
-          con.write_off = 0;
-          // 检查读缓冲区，避免等待下一次 EPOLLIN
-          if (con.read_buf.find("\r\n\r\n") != std::string::npos) {
-              handle_client(client_fd, EPOLLIN, epfd);
-          } else {
-              struct epoll_event ev;
-              ev.events = EPOLLIN;
-              ev.data.fd = client_fd;
-              epoll_ctl(epfd, EPOLL_CTL_MOD, client_fd, &ev);
-          }
-        }
-      }
-    }else if(n==-1){
-      if(errno!=EAGAIN&&errno!=EWOULDBLOCK){
-        std::perror("write error\n");
-        close(client_fd);
-        connections.erase(it);
-        try_resume_listen();
-      }
-    }
-  }
-}
-
-int main(){
-
-  std::cout<<"-----服务器开始运行-----\n";
-  int listen_fd=socket(AF_INET,SOCK_STREAM,0);
-  if(listen_fd<0){
-    std::perror("listen error\n");
-    return 1;
-  }
-
-  if(fcntl(listen_fd,F_SETFL,O_NONBLOCK)==-1)std::perror("fcntl failed\n");
-
-  int opt=1;
-  if(setsockopt(listen_fd,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt))<0){
-    std::perror("setsock failed\n");
-    close(listen_fd);
-    return 1;
-  }
-
-  struct sockaddr_in addr;
-  memset(&addr,0,sizeof(addr));
-  addr.sin_family=AF_INET;
-  addr.sin_port=htons(8080);
-  addr.sin_addr.s_addr=INADDR_ANY;
-
-  if(bind(listen_fd,(struct sockaddr*)&addr,sizeof(addr))<0){
-    std::perror("bind failed\n");
-    close(listen_fd);
-    return 1;
-  }
-
-  if(listen(listen_fd,SOMAXCONN)<0){
-    std::perror("listen failed\n");
-    close(listen_fd);
-    return 1;
-  }
-
-  int epfd=epoll_create1(0);
-  if(epfd==-1){
-    std::perror("setepoll failed\n");
-    return 1;
-  }
-
-  // 赋值全局变量
-  epfd_global = epfd;
-  listen_fd_global = listen_fd;
-
-  struct epoll_event ev;
-  ev.events=EPOLLIN;
-  ev.data.fd=listen_fd;
-  epoll_ctl(epfd,EPOLL_CTL_ADD,listen_fd,&ev);
-
-  struct epoll_event events[MAX_EVENTS];
-
-  int check_itvl=50;
-  int loop_cnt=0;
-  while(1){
-    int nfds=epoll_wait(epfd,events,MAX_EVENTS,1);//
-
-    if(++loop_cnt>=check_itvl){
-      loop_cnt=0;
-      time_t now=time(nullptr);
-
-      for(auto it=connections.begin();it!=connections.end();){
-        if(now - it->second.last_active>TIMEOUT){
-          std::cout<<"连接超时，关闭 fd="<<it->first<<"\n";
-          close(it->first);
-          it=connections.erase(it);
-          try_resume_listen();
-        }else{
-          it++;
-        }
-      }
-    }
-    if(nfds==-1){
-      std::perror("epollwait failed\n");
-      continue;
-    }
-
-    for(int i=0;i<nfds;i++){
-      if(events[i].data.fd==listen_fd){
-        struct sockaddr_in client_addr;
-        socklen_t client_len=sizeof(client_addr);
-        int client_fd=accept(listen_fd,(struct sockaddr*)&client_addr,&client_len);
-        if(client_fd==-1){
-          if(errno==EMFILE||errno==ENFILE){
-            epoll_ctl(epfd,EPOLL_CTL_DEL,listen_fd,nullptr);
-            listen_paused=true;          // 非阻塞暂停
-          }
-          continue;
-        }
-
-        if(fcntl(client_fd,F_SETFL,O_NONBLOCK)==-1){
-          std::perror("setclient failed\n");
-          close(client_fd);
-          continue;
-        }
-
-        struct epoll_event client_ev;
-        client_ev.events=EPOLLIN;
-        client_ev.data.fd=client_fd;
-        epoll_ctl(epfd,EPOLL_CTL_ADD,client_fd,&client_ev);
-
-        connections[client_fd]=Connection();
-        connections[client_fd].last_active=time(nullptr);
-
-        std::cout<<"新连接 fd="<<client_fd<<"\n";
-      }else{
-        int client_fd=events[i].data.fd;
-        handle_client(client_fd,events[i].events,epfd);
-      }
-    }
-  }
+int main() {
+    HttpServer server;
+    if (!server.start()) return 1;
+    server.run();
 }
